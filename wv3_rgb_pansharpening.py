@@ -147,6 +147,6 @@ def process_batch_pipeline(input_dir, output_dir):
 if __name__ == "__main__":
     # 데이터 경로를 실제 환경에 맞게 지정하세요
     source_folder = "wv_data/mul_data"
-    result_folder = "wv_data/resul_pan"
+    result_folder = "wv_data/result_pan"
 
     process_batch_pipeline(source_folder, result_folder)

@@ -120,7 +120,7 @@ def batch_visual_lock_pipeline(tif_dir, shp_dir, output_dir):
 
 
 if __name__ == "__main__":
-    input_tif_folder = "wv_data/result"
+    input_tif_folder = "wv_data/result_pan"
     input_shp_folder = "wv_data/Shapefile"
     output_crop_folder = "wv_data/crop_result"
 
