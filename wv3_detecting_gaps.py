@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import numpy as np
 import rasterio
@@ -7,6 +8,12 @@ import geopandas as gpd
 from skimage.filters import threshold_otsu
 from skimage.morphology import remove_small_objects, closing, disk
 import warnings
+
+# Windows cp949 콘솔에서도 한글·특수문자(—, →, ⚠ 등) 출력 가능하도록 stdout UTF-8 재설정
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 # matplotlib는 PNG 시각화 전용 — 미설치 시 PNG 단계만 스킵하고 SHP/TIF는 정상 출력
 try:
@@ -163,17 +170,20 @@ def compute_vegetation_index(src, method='msavi2',
 # ==========================================
 # PNG 시각화 (RGB 배경 + 결주 폴리곤 오버레이)
 # ==========================================
-def render_gap_png(rgb_path, gdf, title_text, info_lines, output_path,
-                   area_label_threshold=2.0):
+def render_gap_png(rgb_path, gdf, title_text, info_lines, output_path):
     """
     배경 RGB 위에 결주 폴리곤을 오버레이한 PNG를 생성.
 
-    :param rgb_path: 배경으로 사용할 CleanStandardRGB_Crop.tif 경로
-    :param gdf: 결주 폴리곤 GeoDataFrame (비어있어도 OK — 배경만 출력)
+    레이아웃:
+      - 상단 제목 (필지/날짜/해상도)
+      - 중앙: RGB 배경 + 결주 폴리곤(주황 반투명 + 빨간 외곽). 폴리곤 면적 라벨은 표시 안 함.
+      - 하단(이미지 외부): 통계 박스 (이미지와 겹치지 않도록 figure 좌표계 사용)
+
+    :param rgb_path: 배경 RGB raster 경로
+    :param gdf: 결주 폴리곤 GeoDataFrame (비어있어도 OK)
     :param title_text: 상단 제목
-    :param info_lines: 좌하단 통계 박스에 표시할 텍스트 라인 리스트
+    :param info_lines: 하단 통계 박스에 표시할 텍스트 라인 리스트
     :param output_path: 저장할 PNG 경로
-    :param area_label_threshold: 이 면적(㎡) 이상 폴리곤에 면적 라벨 표시
     """
     if not MATPLOTLIB_AVAILABLE:
         print("   [skip] matplotlib 미설치 — PNG 생략")
@@ -183,7 +193,9 @@ def render_gap_png(rgb_path, gdf, title_text, info_lines, output_path,
         print(f"   [skip] RGB 파일 없음 — PNG 생략: {os.path.basename(rgb_path)}")
         return False
 
-    fig, ax = plt.subplots(figsize=(12, 10))
+    # 이미지(axes) 위·아래에 명시적 여백 → 하단 정보박스가 이미지와 겹치지 않음
+    fig = plt.figure(figsize=(12, 11))
+    ax = fig.add_axes([0.03, 0.14, 0.94, 0.80])  # [left, bottom, width, height]
 
     with rasterio.open(rgb_path) as rgb_src:
         rio_show(rgb_src, ax=ax)
@@ -191,40 +203,24 @@ def render_gap_png(rgb_path, gdf, title_text, info_lines, output_path,
     # 한글 fontproperties — 모든 텍스트 요소에 명시적으로 전달해 폰트 누락 방지
     fp_kw = {'fontproperties': KOREAN_FONT} if KOREAN_FONT else {}
 
-    has_geom = (gdf is not None) and (not gdf.empty)
-    if has_geom:
-        # 결주 폴리곤 = 주황 반투명 + 빨간 외곽
+    if (gdf is not None) and (not gdf.empty):
+        # 결주 폴리곤 = 주황 반투명 + 빨간 외곽 (면적 라벨은 표시 안 함)
         gdf.plot(ax=ax, facecolor='orange', edgecolor='red', linewidth=0.8, alpha=0.55)
-
-        # 큰 폴리곤에 면적 라벨
-        for _, row in gdf.iterrows():
-            if row.get('area_sqm', 0) >= area_label_threshold:
-                centroid = row.geometry.centroid
-                ax.annotate(
-                    f"{row.area_sqm:.1f}㎡",
-                    xy=(centroid.x, centroid.y),
-                    color='white', fontsize=8, ha='center', va='center',
-                    fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.2',
-                              facecolor='black', alpha=0.55, edgecolor='none'),
-                    **fp_kw,
-                )
 
     ax.set_title(title_text, fontsize=14, fontweight='bold', pad=15, **fp_kw)
     ax.set_axis_off()
 
-    # 좌하단 통계 박스 (family='monospace' 제거 — 한글 글리프 없는 폰트로 폴백되어 □□ 발생했었음)
-    ax.text(
-        0.02, 0.02, '\n'.join(info_lines),
-        transform=ax.transAxes,
-        fontsize=10, verticalalignment='bottom', horizontalalignment='left',
-        bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
-                  alpha=0.88, edgecolor='gray'),
+    # 통계 박스 — figure 좌표로 axes 아래 별도 영역에 배치 (이미지와 절대 겹치지 않음)
+    fig.text(
+        0.5, 0.06, '\n'.join(info_lines),
+        ha='center', va='center', fontsize=10,
+        bbox=dict(boxstyle='round,pad=0.6', facecolor='white',
+                  alpha=0.92, edgecolor='gray'),
         **fp_kw,
     )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    # tight_layout / bbox_inches='tight' 금지 — 위에서 잡은 add_axes 위치를 망가뜨림
+    plt.savefig(output_path, dpi=150)
     plt.close(fig)
     return True
 
@@ -412,6 +408,198 @@ def detect_missing_plants(
 
 
 # ==========================================
+# 드론 single-band TIF → 다중밴드 raster 스택
+# ==========================================
+DRONE_BAND_ORDER = ['BLUE', 'GREEN', 'RED', 'REDEDGE', 'NIR']
+# 위 순서로 스택 시 밴드 인덱스 매핑 (1-based):
+#   1=Blue, 2=Green, 3=Red, 4=RedEdge, 5=NIR
+# → SENSOR_PRESETS['micasense_rededge'] 와 동일 매핑이라 그대로 재사용 가능
+
+# osgeo 가용성 — VRT(가상 raster, ~1KB) vs multi-band GeoTIFF(실제 데이터 복제) 결정
+try:
+    from osgeo import gdal as _gdal_check
+    _gdal_check.UseExceptions()
+    HAS_OSGEO = True
+    DRONE_STACK_EXT = '.vrt'  # 가상 raster, 디스크 절약
+except ImportError:
+    HAS_OSGEO = False
+    DRONE_STACK_EXT = '.tif'  # multi-band GeoTIFF (osgeo 없을 때)
+
+
+def stack_drone_bands(folder, base_name, output_path,
+                       band_order=DRONE_BAND_ORDER):
+    """
+    드론의 single-band TIF 5개를 multi-band raster로 묶음.
+
+    파일명 패턴: {base_name}_{BAND}.tif (예: SM01_01_250728_RED.tif)
+
+    output_path 확장자가 .vrt면 GDAL VRT(가상 raster, ~1KB) 생성.
+    그 외(예: .tif)는 multi-band GeoTIFF로 실제 데이터 복제.
+
+    osgeo 미설치 시 .vrt 요청도 GeoTIFF 폴백.
+    """
+    files = [os.path.join(folder, f"{base_name}_{b}.tif") for b in band_order]
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+        raise FileNotFoundError(
+            f"누락된 밴드: {[os.path.basename(m) for m in missing]}"
+        )
+
+    if output_path.lower().endswith('.vrt'):
+        try:
+            from osgeo import gdal
+            gdal.UseExceptions()
+            opts = gdal.BuildVRTOptions(separate=True)
+            ds = gdal.BuildVRT(output_path, files, options=opts)
+            # 명시적 close 필수 — 안 하면 디스크 플러시 안 됨
+            ds.FlushCache()
+            ds = None
+            return output_path
+        except ImportError:
+            # osgeo 없으면 .vrt 확장자라도 GeoTIFF로 폴백
+            output_path = output_path[:-4] + '.tif'
+
+    # GeoTIFF multi-band 스택
+    with rasterio.open(files[0]) as src0:
+        meta = src0.meta.copy()
+        meta.update(count=len(band_order), compress='lzw')
+
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        for i, f in enumerate(files, 1):
+            with rasterio.open(f) as s:
+                dst.write(s.read(1), i)
+
+    return output_path
+
+
+def run_drone_batch(input_folder, result_folder,
+                     band_order=DRONE_BAND_ORDER,
+                     sensor_params=None,
+                     index_method='msavi2',
+                     min_gap_area_sqm=0.5,
+                     closing_radius=None,
+                     row_spacing_m=0.65,
+                     gsd_label='drone',
+                     keep_stack=False):
+    """
+    드론 single-band TIF 묶음을 일괄 처리.
+
+    동작:
+      1) 폴더 내 *_RED.tif를 기준으로 필지 식별
+      2) 각 필지의 5밴드를 VRT로 묶음
+      3) 같은 base_name의 *_RGB.tif가 있으면 PNG 배경으로 사용
+      4) detect_missing_plants 호출
+
+    :param band_order: 스택 시 밴드 순서. 기본 [BLUE,GREEN,RED,REDEDGE,NIR]
+    :param sensor_params: dict(band_red, band_nir, band_red_edge).
+                          None이면 band_order 기준 자동 계산
+    :param gsd_label: 출력 파일명에 들어갈 해상도 라벨 (예: 'drone', '4cm')
+    :param keep_stack: True면 VRT 보관, False면 처리 후 삭제
+    """
+    if not os.path.exists(result_folder):
+        os.makedirs(result_folder)
+
+    # band_order 기반 자동 sensor_params (각 밴드의 출력 인덱스)
+    if sensor_params is None:
+        try:
+            sensor_params = dict(
+                band_red=band_order.index('RED') + 1,
+                band_nir=band_order.index('NIR') + 1,
+                band_red_edge=band_order.index('REDEDGE') + 1,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"band_order에 'RED'/'NIR'/'REDEDGE' 모두 포함 필요: {band_order}"
+            ) from e
+
+    red_files = sorted(glob.glob(os.path.join(input_folder, "*_RED.tif")))
+    if not red_files:
+        print(f"⚠️  {input_folder}/*_RED.tif 매칭 없음.")
+        return
+
+    print(f"[드론 배치 시작] {len(red_files)}개 필지")
+    print(f"           band_order={band_order} → sensor={sensor_params}")
+    print(f"           index={index_method}, row_spacing={row_spacing_m}m, "
+          f"min_gap={min_gap_area_sqm}㎡, "
+          f"closing={closing_radius if closing_radius is not None else '자동'}")
+
+    stack_dir = os.path.join(result_folder, '_stack')
+    if not os.path.exists(stack_dir):
+        os.makedirs(stack_dir)
+
+    n_success, n_skip, n_error = 0, 0, 0
+
+    for i, red_file in enumerate(red_files, 1):
+        base = os.path.basename(red_file).replace('_RED.tif', '')
+        print(f"\n----- [{i}/{len(red_files)}] {base} -----")
+
+        # 1) 5밴드 → VRT(osgeo 있음) 또는 multi-band GeoTIFF
+        stack_path_req = os.path.join(stack_dir, f"{base}_STACK{DRONE_STACK_EXT}")
+        try:
+            # 반환값이 실제 생성된 경로 (osgeo 없으면 .tif 폴백)
+            stack_path = stack_drone_bands(input_folder, base, stack_path_req, band_order)
+        except FileNotFoundError as e:
+            print(f"❌ 스택 실패: {e}")
+            n_error += 1
+            continue
+        print(f"   - 스택 생성: {os.path.basename(stack_path)} "
+              f"({'VRT' if stack_path.endswith('.vrt') else 'GeoTIFF'})")
+
+        # 2) RGB 배경 자동 인식
+        rgb_candidate = os.path.join(input_folder, f"{base}_RGB.tif")
+        rgb = rgb_candidate if os.path.exists(rgb_candidate) else None
+
+        # 3) base_name에서 field/date 추출 (예: SM01_01_250728)
+        parts = base.split('_')
+        if len(parts) < 3:
+            print(f"⚠️  파일명 형식 불일치: {base}")
+            n_skip += 1
+            continue
+        field_code, date_str = parts[0], parts[2]
+
+        # 4) 결주 분석
+        try:
+            result = detect_missing_plants(
+                input_filepath=stack_path,
+                output_dir=result_folder,
+                index_method=index_method,
+                min_gap_area_sqm=min_gap_area_sqm,
+                closing_radius=closing_radius,
+                row_spacing_m=row_spacing_m,
+                field_code=field_code,
+                date_str=date_str,
+                gsd_label=gsd_label,
+                rgb_path=rgb,
+                **sensor_params,
+            )
+            if result is None:
+                n_skip += 1
+            else:
+                n_success += 1
+        except Exception as e:
+            n_error += 1
+            print(f"❌ 분석 실패: {e}")
+
+        # 5) 임시 스택 정리
+        if not keep_stack and os.path.exists(stack_path):
+            try:
+                # VRT은 동시에 .ovr 등 생성 안 됨, 안전하게 단일 파일 삭제
+                os.remove(stack_path)
+            except OSError:
+                pass
+
+    # _stack 폴더가 비었으면 정리
+    if not keep_stack:
+        try:
+            if os.path.isdir(stack_dir) and not os.listdir(stack_dir):
+                os.rmdir(stack_dir)
+        except OSError:
+            pass
+
+    print(f"\n[드론 배치 종료] 성공 {n_success} / 스킵 {n_skip} / 오류 {n_error}")
+
+
+# ==========================================
 # 배치 처리 (재사용 함수)
 # ==========================================
 def run_batch(input_folder, result_folder, file_pattern, sensor_params,
@@ -467,7 +655,7 @@ if __name__ == "__main__":
     # ============================================================
     # 모드 선택: 'wv3' (위성, 새만금) 또는 'drone' (드론, 육지)
     # ============================================================
-    MODE = 'wv3'
+    MODE = 'drone'
 
     if MODE == 'wv3':
         # ── WV3 위성 — 새만금 간척지 + 논콩 ──
@@ -483,22 +671,23 @@ if __name__ == "__main__":
         )
 
     elif MODE == 'drone':
-        # ── 드론 다중분광 — 육지 + 논콩 ──
-        # 1) 센서 종류에 맞춰 SENSOR_PRESETS 선택 또는 직접 지정
-        # 2) row_spacing_m은 작물에 따라 (논콩 0.65, 옥수수 0.75, 콩 0.50 등)
-        # 3) closing_radius는 None으로 두면 픽셀 크기에 맞춰 자동 산출됨
-        #    (드론 5cm 해상도 + 65cm 행간 → 자동 6~7px)
-        # 4) 드론 정사영상이 RGB 시각화 가능하면 rgb_resolver로 전달
-        run_batch(
-            input_folder="drone_data/orthomosaics",
-            result_folder="drone_data/result_gaps",
-            file_pattern="*.tif",
-            sensor_params=SENSOR_PRESETS['dji_mavic3m'],  # 또는 'micasense_rededge' 등
-            index_method='msavi2',       # 육지 일반토는 ndvi도 OK
-            min_gap_area_sqm=0.5,        # 보식 단위
-            closing_radius=None,         # 자동 (행간·픽셀 기반)
-            row_spacing_m=0.65,          # 논콩 행간
-            # rgb_resolver=lambda p: p.replace('_MS.tif', '_RGB.tif'),  # 별도 RGB가 있을 때
+        # ── 드론 다중분광 — single-band TIF 묶음 처리 ──
+        # 입력 폴더에 {base}_BLUE.tif / _GREEN.tif / _RED.tif / _REDEDGE.tif / _NIR.tif
+        # 가 한 세트로 존재해야 함. {base}_RGB.tif 가 있으면 PNG 배경으로 자동 사용.
+        #
+        # row_spacing_m: 작물 행간 (논콩 0.65, 옥수수 0.75, 양파 0.18 등)
+        # closing_radius=None: 자동 산출 (4cm 해상도 + 65cm 행간 → 약 8px)
+        # gsd_label: 출력 파일명에 들어갈 라벨 ('drone', '4cm' 등)
+        run_drone_batch(
+            input_folder="wv_data/drone_data",
+            result_folder="wv_data/drone_result_gaps",
+            band_order=['BLUE', 'GREEN', 'RED', 'REDEDGE', 'NIR'],  # 스택 순서
+            index_method='msavi2',   # 'ndvi' 비교도 권장
+            min_gap_area_sqm=0.5,
+            closing_radius=None,     # 자동 (4cm + 65cm → 약 8px)
+            row_spacing_m=0.65,      # 논콩
+            gsd_label='drone',       # 또는 '4cm'
+            keep_stack=False,        # True면 result_folder/_stack/ 에 VRT 보관 (디버깅용)
         )
 
     else:
