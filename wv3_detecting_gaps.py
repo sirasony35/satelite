@@ -116,7 +116,8 @@ def compute_vegetation_index(src, method='msavi2',
 
     method 선택:
       - 'msavi2' (기본): 토양 보정선 자체 산출.
-                   염류토(간척지) 또는 사질토 배경에서 NDVI 부풀림 보정.
+                   사질토(간척지·새만금 등) 또는 밝은 일반 토양 배경에서
+                   NDVI의 토양 brightness 민감도를 보정.
                    파종~영양생장기처럼 토양 노출 많은 시기에 특히 강함.
       - 'ndvi'   : (NIR - Red) / (NIR + Red).
                    표준·scale-invariant. 폐쇄 캐노피기에는 MSAVI2와 거의 동등.
@@ -655,7 +656,7 @@ if __name__ == "__main__":
     # ============================================================
     # 모드 선택: 'wv3' (위성, 새만금) 또는 'drone' (드론, 육지)
     # ============================================================
-    MODE = 'wv3'
+    MODE = 'drone'
 
     if MODE == 'wv3':
         # ── WV3 위성 — 새만금 간척지 + 논콩 ──
@@ -664,7 +665,7 @@ if __name__ == "__main__":
             result_folder="wv_data/result_gaps",
             file_pattern="*_PANSHARP_8B_Crop.tif",
             sensor_params=SENSOR_PRESETS['wv3'],
-            index_method='msavi2',       # 간척지 염류토는 MSAVI2 권장
+            index_method='msavi2',       # 간척지 사질토는 MSAVI2 권장 (NDVI의 토양 brightness 민감도 회피)
             min_gap_area_sqm=0.5,
             closing_radius=2,            # 30cm GSD 명시 (자동도 약 2가 나옴)
             row_spacing_m=0.65,          # 논콩
