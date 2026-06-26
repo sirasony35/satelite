@@ -75,6 +75,10 @@ SENSOR_PRESETS = {
 
     # Parrot Sequoia (Green/Red/RedEdge/NIR) — 4밴드
     'parrot_sequoia':     dict(band_red=2, band_nir=4, band_red_edge=3),
+
+    # PlanetScope SuperDove (Coastal/Blue/GreenI/Green/Yellow/Red/RedEdge/NIR) — 8밴드
+    # 사용자 첨부 순서: band1=CoastalBlue ... band8=NIR
+    'planetscope_superdove': dict(band_red=6, band_nir=8, band_red_edge=7),
 }
 
 
@@ -654,7 +658,7 @@ def run_batch(input_folder, result_folder, file_pattern, sensor_params,
 if __name__ == "__main__":
 
     # ============================================================
-    # 모드 선택: 'wv3' (위성, 새만금) 또는 'drone' (드론, 육지)
+    # 모드 선택: 'wv3' / 'drone' / 'planetscope'
     # ============================================================
     MODE = 'drone'
 
@@ -691,5 +695,21 @@ if __name__ == "__main__":
             keep_stack=False,        # True면 result_folder/_stack/ 에 VRT 보관 (디버깅용)
         )
 
+    elif MODE == 'planetscope':
+        # ── PlanetScope (SuperDove 8밴드) — 필지 분할까지 마친 결과 분석 ──
+        # 전제: wv3_spatial_corp.py MODE='planetscope' 먼저 실행해
+        #       wv_data/planetscope_crop_result/ 에 *_PS_8B_Crop.tif 생성됐어야 함.
+        # PlanetScope GSD 3m → 행간 65cm는 0.2 px → closing_radius=1 충분
+        run_batch(
+            input_folder="wv_data/planetscope_crop_result",
+            result_folder="wv_data/planetscope_result_gaps",
+            file_pattern="*_PS_8B_Crop.tif",
+            sensor_params=SENSOR_PRESETS['planetscope_superdove'],
+            index_method='msavi2',
+            min_gap_area_sqm=2.0,    # 3m GSD에선 1 픽셀 = 9㎡, 작은 결주는 검출 불가
+            closing_radius=1,        # 3m GSD에서 행간 sub-pixel → closing 거의 불필요
+            row_spacing_m=0.65,
+        )
+
     else:
-        raise ValueError(f"알 수 없는 MODE: {MODE}. 'wv3' 또는 'drone' 중 선택.")
+        raise ValueError(f"알 수 없는 MODE: {MODE}. 'wv3'/'drone'/'planetscope' 중 선택.")
