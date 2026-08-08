@@ -60,6 +60,10 @@ SENSOR_PRESETS = {
     # WorldView-3 위성 8밴드 (Coastal/Blue/Green/Yellow/Red/RedEdge/NIR1/NIR2)
     'wv3':                dict(band_red=5, band_nir=7, band_red_edge=6),
 
+    # WorldView Legion 위성 8밴드 (Coastal/Blue/Green/Yellow/Red/RedEdge1/RedEdge2/NIR)
+    # WV3와 달리 밴드 7이 RedEdge2이고 NIR은 밴드 8 하나뿐 — 'wv3' preset 혼용 금지
+    'wv_legion':          dict(band_red=5, band_nir=8, band_red_edge=6),
+
     # MicaSense RedEdge / Altum (Blue/Green/Red/NIR/RedEdge) — 5밴드 멀티스펙트럴
     'micasense_rededge':  dict(band_red=3, band_nir=4, band_red_edge=5),
     'micasense_altum':    dict(band_red=3, band_nir=4, band_red_edge=5),

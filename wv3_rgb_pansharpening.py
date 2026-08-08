@@ -14,6 +14,15 @@ PAN_WEIGHTS_WV3 = np.array(
     dtype='float32'
 )
 
+# WorldView Legion 8밴드 (Coastal/Blue/Green/Yellow/Red/RedEdge1/RedEdge2/NIR)용 가중치
+# WV3와 달리 B6/B7이 RedEdge1/RedEdge2이고 B8이 유일한 NIR.
+# PAN(450-800nm) 대역 내 각 밴드의 유효대역폭(XML EFFECTIVEBANDWIDTH) 비례 배분:
+#   Coastal(400-450) 밖 → 0 / NIR(770-895)은 770-800 구간만 부분 기여
+PAN_WEIGHTS_LEGION = np.array(
+    [0.00, 0.20, 0.23, 0.13, 0.20, 0.07, 0.07, 0.10],
+    dtype='float32'
+)
+
 
 def _box_blur(arr, ksize=5):
     """
@@ -37,12 +46,18 @@ def _box_blur(arr, ksize=5):
     return v_blurred.astype(arr.dtype)
 
 
-def wv3_pansharpen_dual_export_5179(ms_file, pan_file, out_8b_file, out_rgb_file):
+def wv3_pansharpen_dual_export_5179(ms_file, pan_file, out_8b_file, out_rgb_file,
+                                    pan_weights=None):
     """
-    WV3 PAN 응답대역 가중 Pseudo-PAN으로 팬샤프닝 후 EPSG:5179로 재투영.
+    PAN 응답대역 가중 Pseudo-PAN으로 팬샤프닝 후 EPSG:5179로 재투영.
     1. 분석용 8밴드 (uint16, 원본 수치 보존)
     2. 시각화용 RGB (uint8, 유효 footprint 한정 스트레칭으로 타일간 색감 안정)
+
+    :param pan_weights: 밴드별 Pseudo-PAN 가중치 (8,). None이면 Legion 가중치.
+                        WV3 원본 처리 시 PAN_WEIGHTS_WV3 명시 지정.
     """
+    if pan_weights is None:
+        pan_weights = PAN_WEIGHTS_LEGION
     # 1. PAN 로드 (원본 NoData 정보 유지)
     with rasterio.open(pan_file) as pan_src:
         pan_meta = pan_src.meta.copy()
@@ -72,8 +87,8 @@ def wv3_pansharpen_dual_export_5179(ms_file, pan_file, out_8b_file, out_rgb_file
     ms_valid = np.all(ms_stack != ms_nodata, axis=0)
     valid_mask = pan_valid & ms_valid  # (H, W) bool
 
-    # 4. WV3 가중 Pseudo-PAN 산출 후 ratio 계산
-    weights = PAN_WEIGHTS_WV3[:, None, None]
+    # 4. 가중 Pseudo-PAN 산출 후 ratio 계산
+    weights = pan_weights[:, None, None]
     pseudo_pan = np.sum(ms_stack * weights, axis=0)
 
     # 0 분모 방지: 유효 영역 외부는 어차피 마스킹되므로 안전한 값으로 채움
@@ -211,6 +226,86 @@ def wv3_pansharpen_dual_export_5179(ms_file, pan_file, out_8b_file, out_rgb_file
         dest_rgb.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
 
 
+def process_raw_delivery_pipeline(input_root, output_dir,
+                                  pan_weights=None,
+                                  scene_filter=None,
+                                  skip_existing=True):
+    """
+    원본 납품 폴더 구조(중첩)를 재귀 탐색해 일괄 팬샤프닝.
+
+    입력 구조: {input_root}/**/{SCENE}_MUL/ 폴더 안의 *MUL*.tif
+               + 형제 폴더    {SCENE}_PAN/ 폴더 안의 *PAN*.tif
+      예) mul_data/콩/260710/SM_01_260710_50_MUL/SM_01_260710_50_MUL.tif
+          mul_data/밀_보리/260316/30cm/SM_03_260312_30_MUL/SM_03_260312_30_MUL_1.tif
+      — 장면 이름은 폴더명({SCENE}_MUL)에서 추출하므로 내부 tif의 `_1` 접미사
+        유무와 무관하게 동작.
+
+    출력: {output_dir}/{SCENE}_PANSHARP_8B_1.tif, {SCENE}_CleanStandardRGB_1.tif
+      — 후속 crop 단계의 `_` 파싱 규약(마지막 토큰이 일련번호)을 위해 `_1` 접미사 유지.
+
+    :param pan_weights: Pseudo-PAN 가중치. None이면 Legion (현재 납품 위성 기준)
+    :param scene_filter: SCENE 이름에 포함돼야 할 문자열 리스트 (None이면 전체)
+                         예: ['RL_01', 'SM_01_260710']
+    :param skip_existing: True면 8B/RGB 둘 다 이미 존재하는 장면은 건너뜀
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    mul_dirs = sorted(glob.glob(
+        os.path.join(input_root, "**", "*_MUL"), recursive=True
+    ))
+    mul_dirs = [d for d in mul_dirs if os.path.isdir(d)]
+    if not mul_dirs:
+        print(f"⚠️  {input_root} 하위에서 *_MUL 폴더 매칭 없음.")
+        return
+
+    n_success, n_skip, n_error = 0, 0, 0
+    for mul_dir in mul_dirs:
+        scene = os.path.basename(mul_dir)[:-len("_MUL")]
+
+        if scene_filter and not any(key in scene for key in scene_filter):
+            continue
+
+        # 폴더 안의 MUL tif (파일명 `_1` 접미사 유무 무관)
+        mul_candidates = sorted(glob.glob(os.path.join(mul_dir, "*MUL*.tif")))
+        if not mul_candidates:
+            print(f"  [스킵] MUL tif 없음: {scene}")
+            n_skip += 1
+            continue
+        ms_path = mul_candidates[0]
+
+        # 형제 _PAN 폴더에서 짝 찾기
+        pan_candidates = sorted(glob.glob(os.path.join(
+            os.path.dirname(mul_dir), f"{scene}_PAN", "*PAN*.tif"
+        )))
+        if not pan_candidates:
+            print(f"  [스킵] PAN 짝 없음: {scene}")
+            n_skip += 1
+            continue
+        pan_path = pan_candidates[0]
+
+        out_8b_path = os.path.join(output_dir, f"{scene}_PANSHARP_8B_1.tif")
+        out_rgb_path = os.path.join(output_dir, f"{scene}_CleanStandardRGB_1.tif")
+
+        if skip_existing and os.path.exists(out_8b_path) and os.path.exists(out_rgb_path):
+            print(f"  [스킵] 기존 출력 존재: {scene}")
+            n_skip += 1
+            continue
+
+        try:
+            print(f"\n[처리 중] {scene} (MUL+PAN → 8B/RGB, EPSG:5179)")
+            wv3_pansharpen_dual_export_5179(
+                ms_path, pan_path, out_8b_path, out_rgb_path, pan_weights=pan_weights
+            )
+            print(f"  [성공] {os.path.basename(out_8b_path)}, {os.path.basename(out_rgb_path)}")
+            n_success += 1
+        except Exception as e:
+            print(f"  [에러] {scene}: {e}")
+            n_error += 1
+
+    print(f"\n[원본 배치 종료] 성공 {n_success} / 스킵 {n_skip} / 오류 {n_error}")
+
+
 def process_batch_pipeline(input_dir, output_dir):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -246,6 +341,18 @@ def process_batch_pipeline(input_dir, output_dir):
 
 
 if __name__ == "__main__":
-    source_folder = "wv_data/mul_data"
-    result_folder = "wv_data/result_pan"
-    process_batch_pipeline(source_folder, result_folder)
+    # ============================================================
+    # 모드 선택: 'raw'(원본 납품 구조, Legion) / 'flat'(정규화 평면 폴더, 구방식)
+    # ============================================================
+    MODE = 'raw'
+
+    if MODE == 'raw':
+        process_raw_delivery_pipeline(
+            input_root="wv_data/mul_data",
+            output_dir="wv_data/result_pan",
+            pan_weights=PAN_WEIGHTS_LEGION,   # 납품 위성 = WorldView Legion
+            scene_filter=None,                # 예: ['RL_01', 'SM_01_260710'] 로 일부만
+            skip_existing=True,
+        )
+    else:
+        process_batch_pipeline("wv_data/mul_data", "wv_data/result_pan")

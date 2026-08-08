@@ -10,10 +10,15 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-def generate_vra_map(input_filepath, growth_stage="early", stress_percentile=15):
+def generate_vra_map(input_filepath, growth_stage="early", stress_percentile=15,
+                     band_nir=8):
     """
     WorldView 다중분광 영상을 기반으로 작물 활력 지수를 산출하고,
     영양 결핍 구역(하위 n%)을 Shapefile로 추출합니다.
+
+    :param band_nir: NIR 밴드 인덱스 (1-based).
+                     WorldView Legion=8 (기본), WV3(NIR1)=7.
+                     Legion은 밴드 7이 RedEdge2이므로 7을 쓰면 NDVI가 왜곡됨.
     """
     # 1. 파일명 파싱 및 규격화 (FieldCode_Date_Type 형태 적용)
     # 입력 예: SM_01_250728_30_MUL_1.tif
@@ -41,11 +46,11 @@ def generate_vra_map(input_filepath, growth_stage="early", stress_percentile=15)
         crs = src.crs
         transform = src.transform
 
-        # 밴드 추출 (3: Green, 4: Yellow, 5: Red, 7: NIR1)
+        # 밴드 추출 (3: Green, 4: Yellow, 5: Red — WV3/Legion 공통. NIR은 band_nir 인자)
         green = src.read(3).astype(np.float32)
         yellow = src.read(4).astype(np.float32)
         red = src.read(5).astype(np.float32)
-        nir1 = src.read(7).astype(np.float32)
+        nir1 = src.read(band_nir).astype(np.float32)
 
         # 3. 생육 단계별 마스킹 (토글 로직)
         ndvi = (nir1 - red) / (nir1 + red + 1e-8)

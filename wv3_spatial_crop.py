@@ -48,11 +48,14 @@ def crop_field(src, shp_path, output_path):
         dest.write(out_image)
 
 
-def batch_crop_pipeline(tif_dir, shp_dir, output_dir):
+def batch_crop_pipeline(tif_dir, shp_dir, output_dir, scene_filter=None):
     """
-    [WV3 전용] result_pan/의 두 산출물을 모두 필지 단위로 분할.
+    [WV 전용] result_pan/의 두 산출물을 모두 필지 단위로 분할.
       - *_CleanStandardRGB*.tif (uint8 3밴드): HPF 보정된 색감 보존
       - *_PANSHARP_8B*.tif       (uint16 8밴드): 식생지수 산출용 원본 반사율 보존
+
+    :param scene_filter: 파일명에 포함돼야 할 문자열 리스트 (None이면 전체)
+                         예: ['RL_01_260702', 'SM_01_260710'] 로 일부 장면만 분할
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -60,6 +63,12 @@ def batch_crop_pipeline(tif_dir, shp_dir, output_dir):
     rgb_files = sorted(glob.glob(os.path.join(tif_dir, "*_CleanStandardRGB*.tif")))
     pan8b_files = sorted(glob.glob(os.path.join(tif_dir, "*_PANSHARP_8B*.tif")))
     shp_files = sorted(glob.glob(os.path.join(shp_dir, "*.shp")))
+
+    if scene_filter:
+        rgb_files = [f for f in rgb_files
+                     if any(k in os.path.basename(f) for k in scene_filter)]
+        pan8b_files = [f for f in pan8b_files
+                       if any(k in os.path.basename(f) for k in scene_filter)]
 
     print(f"[시작] 필지 단위 분할 — RGB {len(rgb_files)}개, 8밴드 {len(pan8b_files)}개, SHP {len(shp_files)}개")
 
