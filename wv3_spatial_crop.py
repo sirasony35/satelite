@@ -2,6 +2,7 @@ import rasterio
 import rasterio.mask
 from rasterio.enums import ColorInterp
 import geopandas as gpd
+import numpy as np
 import os
 import glob
 
@@ -341,14 +342,221 @@ def run_planetscope_batch(input_folder, shp_dir, output_dir,
 
 
 # ==========================================
+# 식생지수 파생 + 필지별 crop
+# ==========================================
+# PlanetScope SuperDove 밴드 매핑 (1-based)
+PS_BAND_INDEX = dict(
+    coastal_blue=1, blue=2, green_i=3, green=4,
+    yellow=5, red=6, red_edge=7, nir=8,
+)
+
+
+def _save_index_raster(arr, ref_meta, transform, output_path,
+                        dtype='float32', nodata=-9999.0):
+    """단일밴드 식생지수 raster 저장 (float32 기본, NaN → nodata)."""
+    if dtype == 'float32':
+        arr = np.where(np.isnan(arr), nodata, arr).astype('float32')
+    meta = ref_meta.copy()
+    meta.update({
+        'driver': 'GTiff',
+        'count': 1,
+        'dtype': dtype,
+        'height': arr.shape[0],
+        'width': arr.shape[1],
+        'transform': transform,
+        'nodata': nodata,
+        'compress': 'lzw',
+    })
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        dst.write(arr, 1)
+
+
+def _save_rgb_uint16(rgb_arr, ref_meta, transform, output_path, nodata=0):
+    """3밴드 RGB(uint16) 저장 + ColorInterp — 원본 값 보존."""
+    meta = ref_meta.copy()
+    meta.update({
+        'driver': 'GTiff',
+        'count': 3,
+        'dtype': rgb_arr.dtype.name,
+        'height': rgb_arr.shape[1],
+        'width': rgb_arr.shape[2],
+        'transform': transform,
+        'nodata': nodata,
+        'photometric': 'RGB',
+        'compress': 'lzw',
+    })
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        dst.write(rgb_arr)
+        dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
+
+
+def _compute_index(cropped, idx_name, bands_map, nodata_val):
+    """
+    cropped multi-band array (n_bands, H, W) 에서 지수 산출.
+    지원: NDVI, GNDVI, NDRE, MSAVI2, EVI2 (Blue 불필요), NDWI (Green+NIR)
+    반환: (H, W) float32, 유효영역 밖은 NaN
+    """
+    def band(name):
+        return cropped[bands_map[name] - 1].astype('float32')
+
+    red = band('red')
+    nir = band('nir')
+    valid = (red != nodata_val) & (nir != nodata_val)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        if idx_name == 'NDVI':
+            denom = nir + red
+            result = np.where(denom > 0, (nir - red) / denom, np.nan)
+        elif idx_name == 'GNDVI':
+            green = band('green')
+            valid = valid & (green != nodata_val)
+            denom = nir + green
+            result = np.where(denom > 0, (nir - green) / denom, np.nan)
+        elif idx_name == 'NDRE':
+            re = band('red_edge')
+            valid = valid & (re != nodata_val)
+            denom = nir + re
+            result = np.where(denom > 0, (nir - re) / denom, np.nan)
+        elif idx_name == 'NDWI':
+            green = band('green')
+            valid = valid & (green != nodata_val)
+            denom = green + nir
+            result = np.where(denom > 0, (green - nir) / denom, np.nan)
+        elif idx_name == 'MSAVI2':
+            radicand = (2 * nir + 1) ** 2 - 8 * (nir - red)
+            radicand = np.where(radicand < 0, 0, radicand)
+            result = (2 * nir + 1 - np.sqrt(radicand)) / 2
+        elif idx_name == 'EVI2':
+            # EVI2 = 2.5 * (NIR - Red) / (NIR + 2.4*Red + 1)
+            denom = nir + 2.4 * red + 1
+            result = np.where(denom > 0, 2.5 * (nir - red) / denom, np.nan)
+        else:
+            raise ValueError(
+                f"지원하지 않는 지수: {idx_name}. "
+                f"'NDVI'/'GNDVI'/'NDRE'/'NDWI'/'MSAVI2'/'EVI2' 중 선택"
+            )
+
+    return np.where(valid, result, np.nan).astype('float32')
+
+
+def crop_and_derive_indices(input_tif, shp_dir, output_dir,
+                             bands_map=None,
+                             indices=('RGB', 'NDVI', 'GNDVI'),
+                             date_label=None,
+                             shp_pattern='*.shp',
+                             skip_existing=True):
+    """
+    단일 multi-band raster를 SHP 폴더의 각 SHP로 crop하고,
+    각 crop에서 여러 식생지수를 산출해 저장.
+
+    출력: {output_dir}/{field}_{date_label}_{INDEX}.tif
+      - RGB: 3밴드 uint16 (원본 값 보존, ColorInterp 자동)
+      - NDVI/GNDVI/NDRE/NDWI/MSAVI2/EVI2: 단일밴드 float32 (nodata=-9999)
+
+    :param input_tif: multi-band raster (예: PlanetScope SuperDove 8밴드 scene)
+    :param shp_dir: 필지 SHP 폴더 (SHP당 1개 필지 폴리곤)
+    :param output_dir: 산출물 폴더
+    :param bands_map: 밴드 이름→인덱스 dict. None이면 PS_BAND_INDEX 사용.
+                      필수 키: red, nir. 선택: blue, green, red_edge (지수 종류에 따라)
+    :param indices: 산출할 지수 리스트.
+                    'RGB' + 'NDVI'/'GNDVI'/'NDRE'/'NDWI'/'MSAVI2'/'EVI2'
+    :param date_label: 출력 파일명 날짜 라벨. None이면 input_tif basename 첫 토큰
+    :param shp_pattern: SHP glob 패턴
+    :param skip_existing: True면 이미 존재하는 출력 파일은 건너뜀
+    """
+    if bands_map is None:
+        bands_map = PS_BAND_INDEX
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    if date_label is None:
+        base = os.path.splitext(os.path.basename(input_tif))[0]
+        date_label = base.split('_')[0]  # 예: '20260802_Sammangeum_...' → '20260802'
+
+    shp_files = sorted(glob.glob(os.path.join(shp_dir, shp_pattern)))
+    if not shp_files:
+        print(f"⚠️  SHP 없음: {shp_dir}/{shp_pattern}")
+        return
+
+    print(f"[식생지수 crop 시작] {os.path.basename(input_tif)}")
+    print(f"  SHP: {len(shp_files)}개")
+    print(f"  지수: {list(indices)}")
+    print(f"  date_label: {date_label}")
+
+    n_success, n_skip_outside, n_skip_exist, n_error = 0, 0, 0, 0
+
+    with rasterio.open(input_tif) as src:
+        print(f"  raster: {src.count}밴드 {src.dtypes[0]}, CRS={src.crs}, "
+              f"pixel={abs(src.transform[0]):.2f}m")
+        nodata_val = src.nodata if src.nodata is not None else 0
+
+        for shp_path in shp_files:
+            field = os.path.basename(shp_path).replace('.shp', '')
+            # 파일명 안전 처리 (괄호·공백만 언더스코어로)
+            field_safe = field.replace('(', '_').replace(')', '').replace(' ', '_')
+
+            gdf = gpd.read_file(shp_path)
+            if gdf.crs != src.crs:
+                gdf = gdf.to_crs(src.crs)
+
+            try:
+                cropped, out_transform = rasterio.mask.mask(
+                    src, gdf.geometry.values, crop=True, nodata=nodata_val
+                )
+            except ValueError:
+                n_skip_outside += 1
+                print(f"  [스킵] {field_safe}: raster 범위 밖")
+                continue
+
+            success_this = []
+            skipped_this = []
+            for idx_name in indices:
+                out_name = f"{field_safe}_{date_label}_{idx_name}.tif"
+                out_path = os.path.join(output_dir, out_name)
+
+                if skip_existing and os.path.exists(out_path):
+                    skipped_this.append(idx_name)
+                    continue
+
+                try:
+                    if idx_name == 'RGB':
+                        r = cropped[bands_map['red'] - 1]
+                        g = cropped[bands_map['green'] - 1]
+                        b = cropped[bands_map['blue'] - 1]
+                        rgb = np.stack([r, g, b])
+                        _save_rgb_uint16(rgb, src.meta, out_transform, out_path,
+                                          nodata=nodata_val)
+                    else:
+                        idx_arr = _compute_index(cropped, idx_name, bands_map, nodata_val)
+                        _save_index_raster(idx_arr, src.meta, out_transform, out_path)
+                    success_this.append(idx_name)
+                except Exception as e:
+                    print(f"  [에러] {field_safe} {idx_name}: {e}")
+                    n_error += 1
+
+            if success_this or skipped_this:
+                n_success += 1
+                sz = cropped.shape[2], cropped.shape[1]
+                msg = f"  [{n_success}/{len(shp_files)}] {field_safe} ({sz[0]}x{sz[1]})"
+                if success_this:
+                    msg += f" 신규 {success_this}"
+                if skipped_this:
+                    msg += f" 기존스킵 {skipped_this}"
+                print(msg)
+
+    print(f"\n[종료] 성공 {n_success} / 범위밖 {n_skip_outside} / 오류 {n_error}")
+
+
+# ==========================================
 # 실행부 (MODE 스위치)
 # ==========================================
 if __name__ == "__main__":
 
     # ============================================================
-    # 모드 선택: 'wv3' / 'planetscope' / 'pcc' / 'pcc_rgb'
+    # 모드 선택: 'wv3' / 'planetscope' / 'pcc' / 'pcc_rgb' / 'pss_saemangeum'
     # ============================================================
-    MODE = 'pcc_rgb'
+    MODE = 'pss_saemangeum'
 
     if MODE == 'wv3':
         # ── WV3: result_pan/ → crop_result/ ──
@@ -402,7 +610,26 @@ if __name__ == "__main__":
             skip_existing=True,
         )
 
+    elif MODE == 'pss_saemangeum':
+        # ── PSS 새만금: 8밴드 PlanetScope SuperDove 광역 scene을 새만금필지 SHP별로 crop ──
+        # 각 필지에서 다음 산출물 생성 (원본 uint16 → RGB는 값 보존, 지수는 float32):
+        #   *_RGB.tif   : band 6/4/2 (Red/Green/Blue) 트루컬러 3밴드
+        #   *_NDVI.tif  : (NIR - Red) / (NIR + Red)           — 일반 식생 활력
+        #   *_GNDVI.tif : (NIR - Green) / (NIR + Green)       — 엽록소·질소 상관 우수
+        #   *_NDRE.tif  : (NIR - RedEdge) / (NIR + RedEdge)  — 조밀 캐노피 활력도
+        #   *_MSAVI2.tif: 토양 보정선 자체 산출               — 사질토 배경 보정
+        # 지수 리스트 조정하려면 indices 파라미터 수정
+        crop_and_derive_indices(
+            input_tif='pss/data/20260802_Sammangeum_Daedong_No.2_SuperX.tif',
+            shp_dir='pss/Shapefile/새만금필지',
+            output_dir='pss/saemangeum_crop_result',
+            indices=('RGB', 'NDVI', 'GNDVI', 'NDRE', 'MSAVI2'),
+            date_label='20260802',    # None이면 파일명에서 자동 추출
+            skip_existing=True,
+        )
+
     else:
         raise ValueError(
-            f"알 수 없는 MODE: {MODE}. 'wv3'/'planetscope'/'pcc'/'pcc_rgb' 중 선택."
+            f"알 수 없는 MODE: {MODE}. "
+            f"'wv3'/'planetscope'/'pcc'/'pcc_rgb'/'pss_saemangeum' 중 선택."
         )
